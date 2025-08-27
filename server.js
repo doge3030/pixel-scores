@@ -1,122 +1,103 @@
 // server.js
-import express from "express";
-import cors from "cors";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+require("dotenv").config();
 
-// --- Config ---
-const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // Prod'da domainini yaz
-
-// --- App ---
 const app = express();
-app.use(cors({ origin: ALLOWED_ORIGIN }));
+
+// CORS: birden fazla origin virgülle eklenebilir
+const allowed = (process.env.CORS_ORIGIN || "*")
+  .split(",")
+  .map(s => s.trim());
+app.use(cors({
+  origin: function (origin, cb) {
+    if (!origin || allowed.includes("*") || allowed.includes(origin)) {
+      return cb(null, true);
+    }
+    return cb(new Error("Not allowed by CORS"), false);
+  }
+}));
+
 app.use(express.json());
 
-// --- DB ---
-let db;
-async function initDb() {
-  db = await open({
-    filename: "./scores.db",
-    driver: sqlite3.Database,
-  });
+// Postgres pool (Railway DATABASE_URL veriyor)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Railway'de genelde SSL gerekir
+  ssl: { rejectUnauthorized: false }
+});
 
-  await db.exec(`
+// tabloyu açılışta oluştur
+async function ensureSchema() {
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS scores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      twitterHandle TEXT,
-      bitcoinAddress TEXT,
-      engelScore INTEGER NOT NULL,
-      bananaScore INTEGER NOT NULL,
-      level INTEGER NOT NULL,
-      totalScore INTEGER NOT NULL,
-      createdAt TEXT NOT NULL
+      id SERIAL PRIMARY KEY,
+      player_id TEXT NOT NULL,
+      player_name TEXT,
+      score INTEGER NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
+    CREATE INDEX IF NOT EXISTS idx_scores_score_desc ON scores (score DESC);
   `);
-
-  await db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_scores_total ON scores(totalScore DESC, createdAt DESC);`
-  );
+  console.log("✅ schema ready");
 }
+ensureSchema().catch(err => {
+  console.error("schema error:", err);
+  process.exit(1);
+});
 
-// --- Helpers ---
-function clampNumber(n, min, max) {
-  n = Number(n);
-  if (Number.isNaN(n)) return min;
-  return Math.max(min, Math.min(max, n));
-}
+// Sağlık kontrolü
+app.get("/", (_req, res) => {
+  res.send("pixel-scores backend is running");
+});
 
-// --- Routes ---
-
-// Skor gönder
-app.post("/submit-score", async (req, res) => {
+// Skor ekle
+app.post("/api/score", async (req, res) => {
   try {
-    const {
-      twitterHandle = "Belirtilmedi",
-      bitcoinAddress = "Belirtilmedi",
-      engelScore,
-      bananaScore,
-      level,
-    } = req.body || {};
-
-    const e = clampNumber(engelScore, 0, 1e6);
-    const b = clampNumber(bananaScore, 0, 1e6);
-    const lvl = clampNumber(level, 1, 999);
-    const total = e + b;
-
-    const createdAt = new Date().toISOString();
-
-    // Yeni skor ekle (0 olsa bile)
-    await db.run(
-      `INSERT INTO scores (twitterHandle, bitcoinAddress, engelScore, bananaScore, level, totalScore, createdAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        String(twitterHandle).slice(0, 50),
-        String(bitcoinAddress).slice(0, 120),
-        e,
-        b,
-        lvl,
-        total,
-        createdAt,
-      ]
+    const { player_id, player_name, score } = req.body || {};
+    if (typeof score !== "number") {
+      return res.status(400).json({ error: "score must be a number" });
+    }
+    await pool.query(
+      "INSERT INTO scores (player_id, player_name, score) VALUES ($1,$2,$3)",
+      [player_id || "anon", player_name || null, score]
     );
 
-    // En yüksek 10 dışındakileri sil
-    await db.run(`
+    // En yüksek 10 kalsın, geri kalanı sil
+    await pool.query(`
       DELETE FROM scores
-      WHERE id NOT IN (
+      WHERE id IN (
         SELECT id FROM scores
-        ORDER BY totalScore DESC, createdAt ASC
-        LIMIT 10
-      )
+        ORDER BY score DESC, id ASC
+        OFFSET 10
+      );
     `);
 
     res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "Sunucu hatası" });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "server_error" });
   }
 });
 
-// Lider tablosu getir (ilk 10)
-app.get("/leaderboard", async (req, res) => {
+// İlk 10'u getir (0 skor olsa da listede yeri varsa görünür)
+app.get("/api/leaderboard", async (_req, res) => {
   try {
-    const rows = await db.all(
-      `SELECT twitterHandle, bitcoinAddress, engelScore, bananaScore, level, totalScore, createdAt
-       FROM scores
-       ORDER BY totalScore DESC, createdAt ASC
-       LIMIT 10`
-    );
-    res.json({ ok: true, data: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "Sunucu hatası" });
+    const { rows } = await pool.query(`
+      SELECT player_id, player_name, score, created_at
+      FROM scores
+      ORDER BY score DESC, id ASC
+      LIMIT 10
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "server_error" });
   }
 });
 
-// --- Başlat ---
-initDb().then(() => {
-  app.listen(PORT, () => {
-    console.log(`✓ Score API http://localhost:${PORT}`);
-  });
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("🚀 listening on " + PORT);
 });
