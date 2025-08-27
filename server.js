@@ -6,40 +6,41 @@ require("dotenv").config();
 
 const app = express();
 
-// CORS: birden fazla origin virgülle eklenebilir
+// CORS
 const allowed = (process.env.CORS_ORIGIN || "*")
   .split(",")
   .map(s => s.trim());
 app.use(cors({
   origin: function (origin, cb) {
-    if (!origin || allowed.includes("*") || allowed.includes(origin)) {
-      return cb(null, true);
-    }
+    if (!origin || allowed.includes("*") || allowed.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"), false);
   }
 }));
-
 app.use(express.json());
 
-// Postgres pool (Railway DATABASE_URL veriyor)
+// Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Railway'de genelde SSL gerekir
   ssl: { rejectUnauthorized: false }
 });
 
-// tabloyu açılışta oluştur
+// ---- Schema / Migration ----
 async function ensureSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS scores (
       id SERIAL PRIMARY KEY,
-      player_id TEXT NOT NULL,
-      player_name TEXT,
+      -- toplam skor (engelScore + bananaScore)
       score INTEGER NOT NULL,
+      -- alt alanlar
+      engel_score INTEGER NOT NULL DEFAULT 0,
+      banana_score INTEGER NOT NULL DEFAULT 0,
+      level INTEGER,
+      bitcoin_address TEXT,
+      twitter_handle TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
-    CREATE INDEX IF NOT EXISTS idx_scores_score_desc ON scores (score DESC);
   `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_scores_score_desc ON scores (score DESC);`);
   console.log("✅ schema ready");
 }
 ensureSchema().catch(err => {
@@ -47,24 +48,44 @@ ensureSchema().catch(err => {
   process.exit(1);
 });
 
-// Sağlık kontrolü
-app.get("/", (_req, res) => {
-  res.send("pixel-scores backend is running");
-});
+// Sağlık
+app.get("/", (_req, res) => res.send("pixel-scores backend is running"));
 
-// Skor ekle
-app.post("/api/score", async (req, res) => {
+/**
+ * Frontend'in istediği: POST /submit-score
+ * Body: { engelScore, bananaScore, level, bitcoinAddress, twitterHandle }
+ * Cevap: { ok: true }
+ */
+app.post("/submit-score", async (req, res) => {
   try {
-    const { player_id, player_name, score } = req.body || {};
-    if (typeof score !== "number") {
-      return res.status(400).json({ error: "score must be a number" });
+    const {
+      engelScore,
+      bananaScore,
+      level,
+      bitcoinAddress,
+      twitterHandle
+    } = req.body || {};
+
+    const engel = Number(engelScore ?? 0);
+    const muz = Number(bananaScore ?? 0);
+    if (!Number.isFinite(engel) || !Number.isFinite(muz)) {
+      return res.status(400).json({ ok: false, error: "engelScore/bananaScore must be numbers" });
     }
+    const total = engel + muz;
+    const lvl = (level === undefined || level === null) ? null : Number(level);
+    if (lvl !== null && !Number.isFinite(lvl)) {
+      return res.status(400).json({ ok: false, error: "level must be a number if provided" });
+    }
+
     await pool.query(
-      "INSERT INTO scores (player_id, player_name, score) VALUES ($1,$2,$3)",
-      [player_id || "anon", player_name || null, score]
+      `
+      INSERT INTO scores (score, engel_score, banana_score, level, bitcoin_address, twitter_handle)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      `,
+      [total, engel, muz, lvl, bitcoinAddress || null, twitterHandle || null]
     );
 
-    // En yüksek 10 kalsın, geri kalanı sil
+    // En yüksek 10 kalsın, 11. ve sonrası silinsin
     await pool.query(`
       DELETE FROM scores
       WHERE id IN (
@@ -77,27 +98,43 @@ app.post("/api/score", async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "server_error" });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// İlk 10'u getir (0 skor olsa da listede yeri varsa görünür)
-app.get("/api/leaderboard", async (_req, res) => {
+/**
+ * Frontend'in istediği: GET /leaderboard?limit=10
+ * Cevap: { ok:true, data:[{ totalScore, engelScore, bananaScore, level, bitcoinAddress, twitterHandle, createdAt }] }
+ */
+app.get("/leaderboard", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT player_id, player_name, score, created_at
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "10", 10), 1), 50);
+    const { rows } = await pool.query(
+      `
+      SELECT score, engel_score, banana_score, level, bitcoin_address, twitter_handle, created_at
       FROM scores
       ORDER BY score DESC, id ASC
-      LIMIT 10
-    `);
-    res.json(rows);
+      LIMIT $1
+      `,
+      [limit]
+    );
+
+    const data = rows.map(r => ({
+      totalScore: r.score,
+      engelScore: r.engel_score,
+      bananaScore: r.banana_score,
+      level: r.level,
+      bitcoinAddress: r.bitcoin_address,
+      twitterHandle: r.twitter_handle,
+      createdAt: r.created_at
+    }));
+
+    res.json({ ok: true, data });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "server_error" });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("🚀 listening on " + PORT);
-});
+app.listen(PORT, () => console.log("🚀 listening on " + PORT));
